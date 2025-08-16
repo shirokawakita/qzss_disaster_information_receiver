@@ -2,6 +2,8 @@
 #include <QZQSM.h>
 #include "QZSSDCX.h"
 #include <M5Unified.h>
+#include <SD.h>
+#include <SPI.h>
 SFE_UBLOX_GNSS myGNSS;
 
 const int rxPin = 16;
@@ -68,6 +70,150 @@ bool isDetailView = false;    // 詳細表示モードかどうか
 unsigned long detailViewStartTime = 0;  // 詳細表示開始時刻
 const unsigned long DETAIL_VIEW_DURATION = 3000;  // 詳細表示維持時間（3秒）
 
+// 画面更新用のタイマー
+unsigned long lastDisplayUpdate = 0;  // 最後の画面更新時刻
+const unsigned long DISPLAY_UPDATE_INTERVAL = 3000;  // 画面更新間隔（3秒）
+
+// SDカード関連
+bool sdCardAvailable = false;  // SDカードの利用可能性
+const char* LOG_FILE_NAME = "/dc_reports.csv";  // ログファイル名
+
+// SDカードの初期化
+bool initSDCard() {
+  Serial.println("Initializing SD card...");
+  
+  // SDカードの初期化を試行
+  if (!SD.begin()) {
+    Serial.println("SD card initialization failed!");
+    Serial.println("SD card may not be inserted or not properly formatted");
+    return false;
+  }
+  
+  // SDカードの存在確認
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    Serial.println("No SD card attached");
+    Serial.println("SD card functionality will be disabled");
+    return false;
+  }
+  
+  Serial.print("SD Card Type: ");
+  if (cardType == CARD_MMC) {
+    Serial.println("MMC");
+  } else if (cardType == CARD_SD) {
+    Serial.println("SDSC");
+  } else if (cardType == CARD_SDHC) {
+    Serial.println("SDHC");
+  } else {
+    Serial.println("UNKNOWN");
+  }
+  
+  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+  Serial.printf("SD Card Size: %lluMB\n", cardSize);
+  
+  // CSVファイルのヘッダーを作成
+  File file = SD.open(LOG_FILE_NAME, FILE_WRITE);
+  if (!file) {
+    Serial.println("Failed to open file for writing");
+    Serial.println("SD card may be write-protected or full");
+    return false;
+  }
+  
+  // ファイルが空の場合のみヘッダーを追加
+  if (file.size() == 0) {
+    file.println("受信日時,メッセージタイプ,衛星ID,メッセージ長,通報内容");
+  }
+  
+  file.close();
+  Serial.println("SD card initialized successfully");
+  Serial.printf("Log file: %s\n", LOG_FILE_NAME);
+  return true;
+}
+
+// DC通報をSDカードに保存
+void saveDCReportToSD(uint8_t messageType, uint8_t svId, uint8_t numWords, uint32_t* words) {
+  // SDカードが利用できない場合は何もしない
+  if (!sdCardAvailable) {
+    return;
+  }
+  
+  File file = SD.open(LOG_FILE_NAME, FILE_APPEND);
+  if (!file) {
+    Serial.println("Failed to open file for appending");
+    Serial.println("SD card may be write-protected, full, or removed");
+    return;
+  }
+  
+  // 受信日時を取得
+  String timestamp = "";
+  if (currentGNSSTime.isValid) {
+    uint8_t jstHour, jstMin, jstSec;
+    convertToJST(currentGNSSTime.hour, currentGNSSTime.min, currentGNSSTime.sec, jstHour, jstMin, jstSec);
+    timestamp = String(2025) + "/" + 
+                String(currentGNSSTime.month < 10 ? "0" : "") + String(currentGNSSTime.month) + "/" + 
+                String(currentGNSSTime.day < 10 ? "0" : "") + String(currentGNSSTime.day) + " " +
+                String(jstHour < 10 ? "0" : "") + String(jstHour) + ":" +
+                String(jstMin < 10 ? "0" : "") + String(jstMin) + ":" +
+                String(jstSec < 10 ? "0" : "") + String(jstSec) + " JST";
+  } else {
+    timestamp = "時刻不明";
+  }
+  
+  // メッセージタイプ名
+  String messageTypeStr = "";
+  if (messageType == 43) {
+    messageTypeStr = "DC Report";
+  } else if (messageType == 44) {
+    messageTypeStr = "DCX";
+  } else {
+    messageTypeStr = "Type " + String(messageType);
+  }
+  
+  // 通報内容を解析
+  String reportContent = "";
+  if (messageType == 43) {
+    // DC Reportの場合
+    uint8_t l1s_msg_buf[32];
+    for (int i = 0; i < numWords; i++) {
+      l1s_msg_buf[(i << 2) + 0] = (words[i] >> 24) & 0xff;
+      l1s_msg_buf[(i << 2) + 1] = (words[i] >> 16) & 0xff;
+      l1s_msg_buf[(i << 2) + 2] = (words[i] >> 8) & 0xff;
+      l1s_msg_buf[(i << 2) + 3] = (words[i]) & 0xff;
+    }
+    
+    dc_report.SetYear(2025);
+    dc_report.Decode(l1s_msg_buf);
+    reportContent = dc_report.GetReport();
+  } else if (messageType == 44) {
+    // DCXの場合
+    uint8_t l1s_msg_buf[32];
+    for (int i = 0; i < numWords; i++) {
+      l1s_msg_buf[(i << 2) + 0] = (words[i] >> 24) & 0xff;
+      l1s_msg_buf[(i << 2) + 1] = (words[i] >> 16) & 0xff;
+      l1s_msg_buf[(i << 2) + 2] = (words[i] >> 8) & 0xff;
+      l1s_msg_buf[(i << 2) + 3] = (words[i]) & 0xff;
+    }
+    
+    dcx_decoder.decode(l1s_msg_buf);
+    reportContent = String(DCXDecoder::get_message_type_str_ja(dcx_decoder.r.a1_message_type)) + " - " +
+                   String(DCXDecoder::get_hazard_category_and_type_ja(dcx_decoder.r.a4_hazard_category_type));
+  }
+  
+  // CSV形式で保存
+  file.print(timestamp);
+  file.print(",");
+  file.print(messageTypeStr);
+  file.print(",");
+  file.print("QZSS-" + String(svId));
+  file.print(",");
+  file.print(numWords);
+  file.print(",");
+  file.println(reportContent);
+  
+  file.close();
+  Serial.printf("DC Report saved to SD: %s\n", LOG_FILE_NAME);
+}
+
 // GNSS時刻を日本時間に変換する関数
 void convertToJST(uint8_t utcHour, uint8_t utcMin, uint8_t utcSec, uint8_t& jstHour, uint8_t& jstMin, uint8_t& jstSec) {
   jstHour = (utcHour + 9) % 24;  // UTC + 9時間
@@ -131,6 +277,7 @@ void displaySatelliteInfo() {
   int qzssL1SReceiving = 0;
   int qzssMaxCno = 0;
   
+  // 現在受信中のQZSS衛星をカウント
   for (int i = 0; i < satelliteCount; i++) {
     if (satellites[i].isQZSS) {
       qzssCount++;
@@ -148,18 +295,29 @@ void displaySatelliteInfo() {
     }
   }
   
-  // L1S信号を受信したが衛星情報にない場合の処理
-  // 保存されたDC通報からQZSS衛星情報を復元
+  // 保存されたDC通報から最近L1S信号を受信した衛星をカウント
+  // （現在の衛星情報に含まれていない場合）
   for (int i = 0; i < dcReportCount; i++) {
     if (dcReports[i].isValid && 
         (dcReports[i].messageType == 43 || dcReports[i].messageType == 44)) {
-      // 最近の通報（5分以内）の場合、QZSS衛星としてカウント
+      // 最近の通報（5分以内）の場合
       unsigned long timeSince = (millis() - dcReports[i].timestamp) / 1000;
       if (timeSince < 300) { // 5分 = 300秒
-        qzssCount++;
-        qzssL1SReceiving++;
-        if (qzssMaxCno == 0) {
-          qzssMaxCno = 20; // 推定信号強度
+        // 現在の衛星情報に含まれているかチェック
+        bool foundInCurrentSatellites = false;
+        for (int j = 0; j < satelliteCount; j++) {
+          if (satellites[j].isQZSS && satellites[j].svId == dcReports[i].svId) {
+            foundInCurrentSatellites = true;
+            break;
+          }
+        }
+        
+        // 現在の衛星情報に含まれていない場合のみ追加カウント
+        if (!foundInCurrentSatellites) {
+          qzssL1SReceiving++;
+          if (qzssMaxCno == 0) {
+            qzssMaxCno = 20; // 推定信号強度
+          }
         }
       }
     }
@@ -320,6 +478,17 @@ void displaySatelliteInfo() {
   } else {
     M5.Lcd.setTextColor(RED);
     M5.Lcd.printf("\nL1S信号: 未検出");
+  }
+  M5.Lcd.setTextColor(WHITE);
+  
+  // SDカード状態表示
+  M5.Lcd.printf("\nSDカード: ");
+  if (sdCardAvailable) {
+    M5.Lcd.setTextColor(GREEN);
+    M5.Lcd.print("利用可能 (ログ保存有効)");
+  } else {
+    M5.Lcd.setTextColor(RED);
+    M5.Lcd.print("未接続 (ログ保存無効)");
   }
   M5.Lcd.setTextColor(WHITE);
   
@@ -841,6 +1010,18 @@ void setup() {
 
   Serial1.begin(9600, SERIAL_8N1, rxPin, txPin);
 
+  // SDカードの初期化
+  M5.Lcd.println("SDカード初期化中...");
+  sdCardAvailable = initSDCard();
+  if (sdCardAvailable) {
+    M5.Lcd.println("SDカード初期化成功");
+    M5.Lcd.println("ログ保存機能: 有効");
+  } else {
+    M5.Lcd.println("SDカード初期化失敗");
+    M5.Lcd.println("ログ保存機能: 無効");
+    M5.Lcd.println("（SDカードなしでも動作可能）");
+  }
+
   // GNSSモジュールの初期化を試行
   M5.Lcd.println("GNSSモジュール接続中...");
   Serial.println("Connecting to GNSS module...");
@@ -932,6 +1113,7 @@ void setup() {
   delay(2000);
   
   displaySatelliteInfo();
+  lastDisplayUpdate = millis();  // 初期画面更新時刻を設定
 }
 
 // QZSSの基本設定を有効にする
@@ -1083,6 +1265,11 @@ void saveDCReport(uint8_t messageType, uint8_t svId, uint8_t numWords, uint32_t*
   
   dcReportCount++;
   Serial.printf("DC Report saved: Type %d, SV %d, Total: %d\n", messageType, svId, dcReportCount);
+  
+  // SDカードが利用可能な場合のみ保存
+  if (sdCardAvailable) {
+    saveDCReportToSD(messageType, svId, numWords, words);
+  }
 }
 
 // 保存したDC通報を表示する関数
@@ -1202,14 +1389,46 @@ void displayDetailedDCReport(int reportIndex = -1) {
     M5.Lcd.printf("衛星ID: QZSS-%d\n", dcReports[displayIndex].svId);
     
     // 受信時刻
-    unsigned long timeSince = (millis() - dcReports[displayIndex].timestamp) / 1000;
-    M5.Lcd.printf("受信時刻: %lus前", timeSince);
+    M5.Lcd.print("受信時刻: ");
     
-    // GNSS時刻が利用可能な場合は日本時間も表示
+    // GNSS時刻が利用可能な場合は受信時刻を日本時間で表示
     if (currentGNSSTime.isValid) {
+      // 受信時刻を計算（現在時刻から経過時間を引く）
+      unsigned long timeSince = (millis() - dcReports[displayIndex].timestamp) / 1000;
+      unsigned long receptionTime = currentGNSSTime.sec - timeSince;
+      int receptionHour = currentGNSSTime.hour;
+      int receptionMin = currentGNSSTime.min;
+      
+      // 秒の調整
+      if (receptionTime < 0) {
+        receptionTime += 60;
+        receptionMin--;
+        if (receptionMin < 0) {
+          receptionMin += 60;
+          receptionHour--;
+          if (receptionHour < 0) {
+            receptionHour += 24;
+          }
+        }
+      }
+      
+      // 分の調整
+      if (receptionMin < 0) {
+        receptionMin += 60;
+        receptionHour--;
+        if (receptionHour < 0) {
+          receptionHour += 24;
+        }
+      }
+      
+      // 日本時間に変換
       uint8_t jstHour, jstMin, jstSec;
-      convertToJST(currentGNSSTime.hour, currentGNSSTime.min, currentGNSSTime.sec, jstHour, jstMin, jstSec);
-      M5.Lcd.printf(" (現在: %02d:%02d:%02d JST)", jstHour, jstMin, jstSec);
+      convertToJST(receptionHour, receptionMin, receptionTime, jstHour, jstMin, jstSec);
+      M5.Lcd.printf("%02d:%02d:%02d JST", jstHour, jstMin, jstSec);
+    } else {
+      // GNSS時刻が利用できない場合は経過時間を表示
+      unsigned long timeSince = (millis() - dcReports[displayIndex].timestamp) / 1000;
+      M5.Lcd.printf("%lus前", timeSince);
     }
     M5.Lcd.println();
     
@@ -1326,6 +1545,12 @@ unsigned long lastDebugTime = 0;
 void loop() {
   myGNSS.checkUblox();
   myGNSS.checkCallbacks();
+  
+  // 画面の自動更新（3秒間隔）
+  if (!isDetailView && (millis() - lastDisplayUpdate > DISPLAY_UPDATE_INTERVAL)) {
+    displaySatelliteInfo();
+    lastDisplayUpdate = millis();
+  }
   
   // デバッグ情報を定期的に出力（10秒間隔）
   if (millis() - lastDebugTime > 10000) {
