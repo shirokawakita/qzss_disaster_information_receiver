@@ -77,45 +77,76 @@ const unsigned long DISPLAY_UPDATE_INTERVAL = 3000;  // 画面更新間隔（3�
 // SDカード関連
 bool sdCardAvailable = false;  // SDカードの利用可能性
 const char* LOG_FILE_NAME = "/dc_reports.csv";  // ログファイル名
+unsigned long lastSDCheck = 0;  // 最後のSDカードチェック時刻
+const unsigned long SD_CHECK_INTERVAL = 30000;  // SDカードチェック間隔（30秒）
 
 // SDカードの初期化
 bool initSDCard() {
+  Serial.println("=== SD Card Initialization ===");
   Serial.println("Initializing SD card...");
   
-  // SDカードの初期化を試行
-  if (!SD.begin()) {
-    Serial.println("SD card initialization failed!");
-    Serial.println("SD card may not be inserted or not properly formatted");
+  // SDカードの初期化を試行（M5Stack Basic 2.7用の修正）
+  if (!SD.begin(GPIO_NUM_4, SPI, 15000000)) {
+    Serial.println("ERROR: SD card initialization failed!");
+    Serial.println("Possible causes:");
+    Serial.println("1. SD card not inserted");
+    Serial.println("2. SD card not properly formatted (FAT32 required)");
+    Serial.println("3. SD card is corrupted");
+    Serial.println("4. SD card is write-protected");
+    Serial.println("5. SD card slot hardware issue");
+    Serial.println("6. SD card is incompatible (try different card)");
     return false;
   }
   
   // SDカードの存在確認
   uint8_t cardType = SD.cardType();
+  Serial.print("SD Card Type: ");
+  Serial.println(cardType);
+  
   if (cardType == CARD_NONE) {
-    Serial.println("No SD card attached");
+    Serial.println("ERROR: No SD card detected!");
+    Serial.println("Please check:");
+    Serial.println("1. SD card is properly inserted");
+    Serial.println("2. SD card is not damaged");
+    Serial.println("3. SD card slot is clean");
+    Serial.println("4. Try removing and reinserting the card");
     Serial.println("SD card functionality will be disabled");
     return false;
   }
   
-  Serial.print("SD Card Type: ");
+  Serial.print("SD Card Type Name: ");
   if (cardType == CARD_MMC) {
     Serial.println("MMC");
   } else if (cardType == CARD_SD) {
-    Serial.println("SDSC");
+    Serial.println("SDSC (Standard SD)");
   } else if (cardType == CARD_SDHC) {
-    Serial.println("SDHC");
+    Serial.println("SDHC (High Capacity SD)");
   } else {
-    Serial.println("UNKNOWN");
+    Serial.println("UNKNOWN - This may indicate a problem");
   }
   
   uint64_t cardSize = SD.cardSize() / (1024 * 1024);
   Serial.printf("SD Card Size: %lluMB\n", cardSize);
   
+  // カードサイズの妥当性チェック
+  if (cardSize == 0) {
+    Serial.println("WARNING: SD card size is 0MB - card may be corrupted");
+    return false;
+  } else if (cardSize < 100) {
+    Serial.println("WARNING: SD card size is very small - may not be properly formatted");
+  }
+  
   // CSVファイルのヘッダーを作成
+  Serial.println("Testing file write access...");
   File file = SD.open(LOG_FILE_NAME, FILE_WRITE);
   if (!file) {
-    Serial.println("Failed to open file for writing");
-    Serial.println("SD card may be write-protected or full");
+    Serial.println("ERROR: Failed to open file for writing!");
+    Serial.println("Possible causes:");
+    Serial.println("1. SD card is write-protected");
+    Serial.println("2. SD card is full");
+    Serial.println("3. SD card is corrupted");
+    Serial.println("4. File system error");
+    Serial.println("5. Insufficient permissions");
     return false;
   }
   
@@ -125,8 +156,39 @@ bool initSDCard() {
   }
   
   file.close();
-  Serial.println("SD card initialized successfully");
+  Serial.println("SUCCESS: SD card initialized successfully");
   Serial.printf("Log file: %s\n", LOG_FILE_NAME);
+  Serial.println("=== SD Card Initialization Complete ===");
+  return true;
+}
+
+// SDカードの状態をチェック
+bool checkSDCardStatus() {
+  uint8_t cardType = SD.cardType();
+  if (cardType == CARD_NONE) {
+    if (sdCardAvailable) {
+      Serial.println("WARNING: SD card was removed during operation");
+      sdCardAvailable = false;
+    }
+    return false;
+  }
+  
+  // 書き込みテスト
+  File testFile = SD.open("/test.txt", FILE_WRITE);
+  if (!testFile) {
+    if (sdCardAvailable) {
+      Serial.println("WARNING: SD card write access lost");
+      sdCardAvailable = false;
+    }
+    return false;
+  }
+  testFile.close();
+  SD.remove("/test.txt");
+  
+  if (!sdCardAvailable) {
+    Serial.println("INFO: SD card access restored");
+    sdCardAvailable = true;
+  }
   return true;
 }
 
@@ -1550,6 +1612,12 @@ void loop() {
   if (!isDetailView && (millis() - lastDisplayUpdate > DISPLAY_UPDATE_INTERVAL)) {
     displaySatelliteInfo();
     lastDisplayUpdate = millis();
+  }
+  
+  // SDカードの状態チェック（30秒間隔）
+  if (millis() - lastSDCheck > SD_CHECK_INTERVAL) {
+    checkSDCardStatus();
+    lastSDCheck = millis();
   }
   
   // デバッグ情報を定期的に出力（10秒間隔）
