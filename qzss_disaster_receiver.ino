@@ -1,13 +1,3 @@
-//
-// M5Stack Basic (M5Stack Core)で災危通報を表示
-// 2025/08/02 @ksasao
-// 
-// ソースコードは
-// https://www.switch-science.com/blogs/magazine/gps-qzss-dc-report-dcx-receiving の記事にある
-// https://github.com/SWITCHSCIENCE/samplecodes/tree/master/GPS_shield_for_ESPr/espr_dev_qzss_drc_drx_decode
-// を元に画面表示を追加したものです。
-// 機材などの詳細は https://x.com/ksasao/status/1951457364667932775 を参照してください
-
 #include <SparkFun_u-blox_GNSS_Arduino_Library.h>
 #include <QZQSM.h>
 #include "QZSSDCX.h"
@@ -17,9 +7,9 @@ SFE_UBLOX_GNSS myGNSS;
 const int rxPin = 16;
 const int txPin = 17;
 
-#define DBG_PRINT_SFRBX 1
-#define DBG_PRINT_SAT 1
-#define DBG_PRINT_PVT 1
+#define DBG_PRINT_SFRBX 0
+#define DBG_PRINT_SAT 0
+#define DBG_PRINT_PVT 0
 #define DBG_PRINT_DCX_ALL 0
 
 byte l1s_msg_buf[32];  // MAX 250 BITS
@@ -58,6 +48,40 @@ SatelliteInfo satellites[MAX_SATELLITES];
 int satelliteCount = 0;
 unsigned long lastUpdateTime = 0;
 
+// GNSS時刻管理
+struct GNSSTime {
+  uint8_t year;
+  uint8_t month;
+  uint8_t day;
+  uint8_t hour;
+  uint8_t min;
+  uint8_t sec;
+  bool isValid;
+};
+
+GNSSTime currentGNSSTime = {0, 0, 0, 0, 0, 0, false};
+unsigned long lastGNSSUpdateTime = 0;
+
+// 詳細表示用の状態管理
+int currentDetailIndex = -1;  // 現在表示中の通報インデックス（-1=表示なし）
+bool isDetailView = false;    // 詳細表示モードかどうか
+unsigned long detailViewStartTime = 0;  // 詳細表示開始時刻
+const unsigned long DETAIL_VIEW_DURATION = 3000;  // 詳細表示維持時間（3秒）
+
+// GNSS時刻を日本時間に変換する関数
+void convertToJST(uint8_t utcHour, uint8_t utcMin, uint8_t utcSec, uint8_t& jstHour, uint8_t& jstMin, uint8_t& jstSec) {
+  jstHour = (utcHour + 9) % 24;  // UTC + 9時間
+  jstMin = utcMin;
+  jstSec = utcSec;
+}
+
+// 時刻を文字列形式で取得する関数
+String getTimeString(uint8_t hour, uint8_t min, uint8_t sec) {
+  char timeStr[10];
+  sprintf(timeStr, "%02d:%02d:%02d", hour, min, sec);
+  return String(timeStr);
+}
+
 // dwrdを16進数文字列に変換して出力する関数
 const char *dwrd_to_str(uint32_t value) {
   static const char hex_chars[] = "0123456789ABCDEF";  // 16進数文字
@@ -95,6 +119,9 @@ void displaySatelliteInfo() {
     M5.Lcd.println("TX: 1=ON,2=OFF,3=OFF,4=OFF");
     M5.Lcd.println("RX: 1=ON,2=OFF,3=OFF,4=OFF");
     M5.Lcd.println("PPS: 1=OFF (推奨)");
+    M5.Lcd.println("");
+    M5.Lcd.println("QZSS衛星の受信を待機中...");
+    M5.Lcd.println("初回受信まで数分かかる場合があります");
     return;
   }
   
@@ -257,12 +284,25 @@ void displaySatelliteInfo() {
     M5.Lcd.printf("GLONASS: %d機 (最大%d dB)\n", glonassCount, glonassMaxCno);
   }
   
-  // 更新時刻
+  // 更新時刻（日本時間）
   M5.Lcd.println("------------------");
-  M5.Lcd.printf("更新: %02d:%02d:%02d", 
-    (millis() / 60000) % 60, 
-    (millis() / 1000) % 60, 
-    (millis() / 10) % 100);
+  if (currentGNSSTime.isValid) {
+    uint8_t jstHour, jstMin, jstSec;
+    convertToJST(currentGNSSTime.hour, currentGNSSTime.min, currentGNSSTime.sec, jstHour, jstMin, jstSec);
+    M5.Lcd.printf("更新: %02d:%02d:%02d JST", jstHour, jstMin, jstSec);
+    
+    // GNSS時刻の最終更新からの経過時間
+    unsigned long timeSinceGNSSUpdate = (millis() - lastGNSSUpdateTime) / 1000;
+    if (timeSinceGNSSUpdate > 0) {
+      M5.Lcd.printf(" (%lus前)", timeSinceGNSSUpdate);
+    }
+  } else {
+    M5.Lcd.printf("更新: %02d:%02d:%02d", 
+      (millis() / 60000) % 60, 
+      (millis() / 1000) % 60, 
+      (millis() / 10) % 100);
+    M5.Lcd.print(" (GNSS時刻未取得)");
+  }
   
   // 総衛星数表示
   M5.Lcd.printf("\n総衛星数: %d機", satelliteCount);
@@ -289,6 +329,13 @@ void displaySatelliteInfo() {
     if (lastL1SMessageTime > 0) {
       unsigned long timeSinceLast = (millis() - lastL1SMessageTime) / 1000;
       M5.Lcd.printf(" (最終: %lus前)", timeSinceLast);
+      
+      // GNSS時刻が利用可能な場合は最終受信時刻も表示
+      if (currentGNSSTime.isValid) {
+        uint8_t jstHour, jstMin, jstSec;
+        convertToJST(currentGNSSTime.hour, currentGNSSTime.min, currentGNSSTime.sec, jstHour, jstMin, jstSec);
+        M5.Lcd.printf(" (現在: %02d:%02d:%02d JST)", jstHour, jstMin, jstSec);
+      }
     }
   }
 }
@@ -415,8 +462,15 @@ void newSFRBX(UBX_RXM_SFRBX_data_t *data) {
         M5.Lcd.print("【災害通報受信】\n");
         M5.Lcd.print("DC Report (Type 43)\n");
         M5.Lcd.print("受信時刻: ");
-        M5.Lcd.print(millis() / 1000);
-        M5.Lcd.print("秒\n");
+        if (currentGNSSTime.isValid) {
+          uint8_t jstHour, jstMin, jstSec;
+          convertToJST(currentGNSSTime.hour, currentGNSSTime.min, currentGNSSTime.sec, jstHour, jstMin, jstSec);
+          M5.Lcd.printf("%02d:%02d:%02d JST", jstHour, jstMin, jstSec);
+        } else {
+          M5.Lcd.print(millis() / 1000);
+          M5.Lcd.print("秒");
+        }
+        M5.Lcd.print("\n");
         M5.Lcd.print("衛星ID: QZSS-");
         M5.Lcd.print(data->svId);
         M5.Lcd.print("\n");
@@ -456,8 +510,15 @@ void newSFRBX(UBX_RXM_SFRBX_data_t *data) {
         M5.Lcd.print("【DCX通報受信】\n");
         M5.Lcd.print("DCX Message (Type 44)\n");
         M5.Lcd.print("受信時刻: ");
-        M5.Lcd.print(millis() / 1000);
-        M5.Lcd.print("秒\n");
+        if (currentGNSSTime.isValid) {
+          uint8_t jstHour, jstMin, jstSec;
+          convertToJST(currentGNSSTime.hour, currentGNSSTime.min, currentGNSSTime.sec, jstHour, jstMin, jstSec);
+          M5.Lcd.printf("%02d:%02d:%02d JST", jstHour, jstMin, jstSec);
+        } else {
+          M5.Lcd.print(millis() / 1000);
+          M5.Lcd.print("秒");
+        }
+        M5.Lcd.print("\n");
         M5.Lcd.print("衛星ID: QZSS-");
         M5.Lcd.print(data->svId);
         M5.Lcd.print("\n");
@@ -467,7 +528,49 @@ void newSFRBX(UBX_RXM_SFRBX_data_t *data) {
         
         // DCXの詳細情報を表示
         M5.Lcd.print("通報内容:\n");
-        M5.Lcd.print("詳細はシリアル出力を確認");
+        
+        // DCXの基本情報を表示
+        // メッセージタイプ
+        M5.Lcd.print("メッセージ: ");
+        M5.Lcd.println(DCXDecoder::get_message_type_str_ja(dcx_decoder.r.a1_message_type));
+        
+        // 国/地域名
+        M5.Lcd.print("国/地域: ");
+        M5.Lcd.println(DCXDecoder::get_country_region_name_str_ja(dcx_decoder.r.a2_country_region_name));
+        
+        // 情報提供者
+        M5.Lcd.print("提供者: ");
+        M5.Lcd.println(DCXDecoder::get_provider_name_japan(dcx_decoder.r.a3_provider_identifier));
+        
+        // 災害カテゴリ
+        M5.Lcd.print("カテゴリ: ");
+        M5.Lcd.println(DCXDecoder::get_hazard_category_and_type_ja(dcx_decoder.r.a4_hazard_category_type));
+        
+        // 重大度
+        M5.Lcd.print("重大度: ");
+        M5.Lcd.println(DCXDecoder::get_severity_str_ja(dcx_decoder.r.a5_severity));
+        
+        // 災害発生日時
+        if (dcx_decoder.r.a6_hazard_onset_week_number != 0) {
+          M5.Lcd.print("発生週: ");
+          M5.Lcd.println(DCXDecoder::get_hazard_onset_week_number_str_ja(dcx_decoder.r.a6_hazard_onset_week_number));
+        }
+        
+        if (dcx_decoder.r.a7_hazard_onset_ToW != 0) {
+          M5.Lcd.print("発生日時: ");
+          M5.Lcd.println(DCXDecoder::get_hazard_onset_tow_str_ja(dcx_decoder.r.a7_hazard_onset_ToW));
+        }
+        
+        // 避難行動
+        if (dcx_decoder.r.a11_guidance_to_react_library != 0) {
+          M5.Lcd.print("避難行動: ");
+          M5.Lcd.println(DCXDecoder::get_guidance_instruction_library_ja(dcx_decoder.r.a11_guidance_to_react_library));
+        }
+        
+        // 対象地域（J-Alertの場合）
+        if (dcx_decoder.r.a1_message_type == DCX_MSG_J_ALERT) {
+          M5.Lcd.println("対象地域: J-Alert対象地域");
+        }
         
         M5.Lcd.print("\n3秒後に通常表示に戻ります");
         
@@ -483,12 +586,26 @@ void newNAVSAT(UBX_NAV_SAT_data_t *data) {
   int oldCount = satelliteCount;
   satelliteCount = 0;
   
+  // QZSS衛星のL1S状態を保持
+  bool qzssL1SStatus[MAX_SATELLITES] = {false};
+  for (int i = 0; i < oldCount; i++) {
+    if (satellites[i].isQZSS && satellites[i].isL1S) {
+      // QZSS衛星のL1S状態を記録
+      for (int j = 0; j < data->header.numSvs; j++) {
+        if (data->blocks[j].gnssId == 5 && data->blocks[j].svId == satellites[i].svId) {
+          qzssL1SStatus[j] = true;
+          break;
+        }
+      }
+    }
+  }
+  
   for (uint16_t block = 0; block < data->header.numSvs && satelliteCount < MAX_SATELLITES; block++) {
     satellites[satelliteCount].gnssId = data->blocks[block].gnssId;
     satellites[satelliteCount].svId = data->blocks[block].svId;
     satellites[satelliteCount].cno = data->blocks[block].cno;
     satellites[satelliteCount].isQZSS = (data->blocks[block].gnssId == 5);
-    satellites[satelliteCount].isL1S = false; // L1S信号は別途判定（SFRBXで更新）
+    satellites[satelliteCount].isL1S = qzssL1SStatus[block]; // L1S状態を復元
     
     satelliteCount++;
   }
@@ -499,6 +616,23 @@ void newNAVSAT(UBX_NAV_SAT_data_t *data) {
     Serial.print(oldCount);
     Serial.print(" -> ");
     Serial.println(satelliteCount);
+  }
+  
+  // QZSS衛星の検出状況をデバッグ出力
+  int qzssCount = 0;
+  for (int i = 0; i < satelliteCount; i++) {
+    if (satellites[i].isQZSS) {
+      qzssCount++;
+      Serial.printf("QZSS detected: SV-%02d, Signal: %ddB, L1S: %s\n", 
+                   satellites[i].svId, 
+                   satellites[i].cno, 
+                   satellites[i].isL1S ? "YES" : "NO");
+    }
+  }
+  if (qzssCount == 0) {
+    Serial.println("WARNING: No QZSS satellites detected in NAVSAT data");
+  } else {
+    Serial.printf("QZSS satellites detected: %d\n", qzssCount);
   }
   
   // 画面更新（3秒間隔）
@@ -613,9 +747,35 @@ void newNAVSAT(UBX_NAV_SAT_data_t *data) {
 }
 
 void newNAVPVT(UBX_NAV_PVT_data_t *data) {
+  // GNSS時刻を更新
+  if (data->year > 0 && data->month > 0 && data->day > 0) {
+    currentGNSSTime.year = data->year;
+    currentGNSSTime.month = data->month;
+    currentGNSSTime.day = data->day;
+    currentGNSSTime.hour = data->hour;
+    currentGNSSTime.min = data->min;
+    currentGNSSTime.sec = data->sec;
+    currentGNSSTime.isValid = true;
+    lastGNSSUpdateTime = millis();
+  }
+
 #if DBG_PRINT_PVT
-  // 時刻表示
-  Serial.print(F("Time: "));
+  // 時刻表示（日本時間）
+  Serial.print(F("Time (JST): "));
+  uint8_t jstHour, jstMin, jstSec;
+  convertToJST(data->hour, data->min, data->sec, jstHour, jstMin, jstSec);
+  
+  if (jstHour < 10) Serial.print(F("0"));
+  Serial.print(jstHour);
+  Serial.print(F(":"));
+  if (jstMin < 10) Serial.print(F("0"));
+  Serial.print(jstMin);
+  Serial.print(F(":"));
+  if (jstSec < 10) Serial.print(F("0"));
+  Serial.print(jstSec);
+  Serial.print(F(" JST"));
+  
+  Serial.print(F(" (UTC: "));
   uint8_t hms = data->hour;
   if (hms < 10) Serial.print(F("0"));
   Serial.print(hms);
@@ -627,11 +787,7 @@ void newNAVPVT(UBX_NAV_PVT_data_t *data) {
   hms = data->sec;
   if (hms < 10) Serial.print(F("0"));
   Serial.print(hms);
-  Serial.print(F("."));
-  unsigned long millisecs = data->iTOW % 1000;
-  if (millisecs < 100) Serial.print(F("0"));
-  if (millisecs < 10) Serial.print(F("0"));
-  Serial.print(millisecs);
+  Serial.print(F(")"));
 
   // 経度・緯度・高度表示
   long latitude = data->lat;
@@ -988,7 +1144,7 @@ void displaySavedDCReports() {
 }
 
 // 詳細なDC通報表示関数
-void displayDetailedDCReport() {
+void displayDetailedDCReport(int reportIndex = -1) {
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.setTextFont(&fonts::efontJA_16);
   M5.Lcd.setCursor(0, 0);
@@ -1000,55 +1156,75 @@ void displayDetailedDCReport() {
   if (dcReportCount == 0) {
     M5.Lcd.println("保存された通報はありません");
     M5.Lcd.println("ボタンAで通常表示に戻る");
+    currentDetailIndex = -1;
+    isDetailView = false;
     return;
   }
   
-  // 最新の通報を詳細表示
-  int latestIndex = dcReportCount - 1;
-  if (dcReports[latestIndex].isValid) {
-    M5.Lcd.printf("最新通報 #%d\n", latestIndex + 1);
+  // 表示する通報インデックスを決定
+  int displayIndex;
+  if (reportIndex == -1) {
+    // 初回表示時は最新の通報
+    displayIndex = dcReportCount - 1;
+    currentDetailIndex = displayIndex;
+    isDetailView = true;
+    detailViewStartTime = millis();  // タイマー開始
+  } else {
+    // 指定されたインデックスの通報
+    displayIndex = reportIndex;
+    currentDetailIndex = displayIndex;
+    detailViewStartTime = millis();  // タイマー開始
+  }
+  
+  // インデックスの範囲チェック
+  if (displayIndex < 0 || displayIndex >= dcReportCount) {
+    M5.Lcd.println("通報インデックスが無効です");
+    M5.Lcd.println("ボタンAで通常表示に戻る");
+    currentDetailIndex = -1;
+    isDetailView = false;
+    return;
+  }
+  if (dcReports[displayIndex].isValid) {
+    M5.Lcd.printf("通報 #%d/%d\n", displayIndex + 1, dcReportCount);
     M5.Lcd.println("==================");
     
     // メッセージタイプ
-    if (dcReports[latestIndex].messageType == 43) {
+    if (dcReports[displayIndex].messageType == 43) {
       M5.Lcd.print("タイプ: DC Report");
-    } else if (dcReports[latestIndex].messageType == 44) {
+    } else if (dcReports[displayIndex].messageType == 44) {
       M5.Lcd.print("タイプ: DCX");
     } else {
-      M5.Lcd.printf("タイプ: %d", dcReports[latestIndex].messageType);
+      M5.Lcd.printf("タイプ: %d", dcReports[displayIndex].messageType);
     }
-    M5.Lcd.printf(" (Type %d)\n", dcReports[latestIndex].messageType);
+    M5.Lcd.printf(" (Type %d)\n", dcReports[displayIndex].messageType);
     
     // 衛星ID
-    M5.Lcd.printf("衛星ID: QZSS-%d\n", dcReports[latestIndex].svId);
+    M5.Lcd.printf("衛星ID: QZSS-%d\n", dcReports[displayIndex].svId);
     
     // 受信時刻
-    unsigned long timeSince = (millis() - dcReports[latestIndex].timestamp) / 1000;
-    M5.Lcd.printf("受信時刻: %lus前\n", timeSince);
+    unsigned long timeSince = (millis() - dcReports[displayIndex].timestamp) / 1000;
+    M5.Lcd.printf("受信時刻: %lus前", timeSince);
     
-    // メッセージ長
-    M5.Lcd.printf("メッセージ長: %d words\n", dcReports[latestIndex].numWords);
-    
-    // Wordデータ（全表示）
-    M5.Lcd.println("Word Data:");
-    for (int i = 0; i < dcReports[latestIndex].numWords; i++) {
-      M5.Lcd.printf("Word[%d]: %s\n", i, dwrd_to_str(dcReports[latestIndex].words[i]));
+    // GNSS時刻が利用可能な場合は日本時間も表示
+    if (currentGNSSTime.isValid) {
+      uint8_t jstHour, jstMin, jstSec;
+      convertToJST(currentGNSSTime.hour, currentGNSSTime.min, currentGNSSTime.sec, jstHour, jstMin, jstSec);
+      M5.Lcd.printf(" (現在: %02d:%02d:%02d JST)", jstHour, jstMin, jstSec);
     }
+    M5.Lcd.println();
     
     // 通報内容の解析（可能な場合）
     M5.Lcd.println("==================");
-    M5.Lcd.println("通報内容解析:");
+    M5.Lcd.println("通報内容:");
     
-    if (dcReports[latestIndex].messageType == 43) {
+    if (dcReports[displayIndex].messageType == 43) {
       // DC Reportの場合
-      M5.Lcd.println("DC Report (災害通報)");
-      
       // 保存されたwordデータをl1s_msg_bufに復元
-      for (int i = 0; i < dcReports[latestIndex].numWords; i++) {
-        l1s_msg_buf[(i << 2) + 0] = (dcReports[latestIndex].words[i] >> 24) & 0xff;
-        l1s_msg_buf[(i << 2) + 1] = (dcReports[latestIndex].words[i] >> 16) & 0xff;
-        l1s_msg_buf[(i << 2) + 2] = (dcReports[latestIndex].words[i] >> 8) & 0xff;
-        l1s_msg_buf[(i << 2) + 3] = (dcReports[latestIndex].words[i]) & 0xff;
+      for (int i = 0; i < dcReports[displayIndex].numWords; i++) {
+        l1s_msg_buf[(i << 2) + 0] = (dcReports[displayIndex].words[i] >> 24) & 0xff;
+        l1s_msg_buf[(i << 2) + 1] = (dcReports[displayIndex].words[i] >> 16) & 0xff;
+        l1s_msg_buf[(i << 2) + 2] = (dcReports[displayIndex].words[i] >> 8) & 0xff;
+        l1s_msg_buf[(i << 2) + 3] = (dcReports[displayIndex].words[i]) & 0xff;
       }
       
       // QZQSMライブラリで日本語解析
@@ -1057,27 +1233,67 @@ void displayDetailedDCReport() {
       String reportText = dc_report.GetReport();
       
       // 日本語の通報内容を表示
-      M5.Lcd.print("通報内容:\n");
       M5.Lcd.print(reportText);
       
-    } else if (dcReports[latestIndex].messageType == 44) {
+    } else if (dcReports[displayIndex].messageType == 44) {
       // DCXの場合
-      M5.Lcd.println("DCX (拡張災害通報)");
-      
       // 保存されたwordデータをl1s_msg_bufに復元
-      for (int i = 0; i < dcReports[latestIndex].numWords; i++) {
-        l1s_msg_buf[(i << 2) + 0] = (dcReports[latestIndex].words[i] >> 24) & 0xff;
-        l1s_msg_buf[(i << 2) + 1] = (dcReports[latestIndex].words[i] >> 16) & 0xff;
-        l1s_msg_buf[(i << 2) + 2] = (dcReports[latestIndex].words[i] >> 8) & 0xff;
-        l1s_msg_buf[(i << 2) + 3] = (dcReports[latestIndex].words[i]) & 0xff;
+      for (int i = 0; i < dcReports[displayIndex].numWords; i++) {
+        l1s_msg_buf[(i << 2) + 0] = (dcReports[displayIndex].words[i] >> 24) & 0xff;
+        l1s_msg_buf[(i << 2) + 1] = (dcReports[displayIndex].words[i] >> 16) & 0xff;
+        l1s_msg_buf[(i << 2) + 2] = (dcReports[displayIndex].words[i] >> 8) & 0xff;
+        l1s_msg_buf[(i << 2) + 3] = (dcReports[displayIndex].words[i]) & 0xff;
       }
       
       // QZSSDCXライブラリで日本語解析
       dcx_decoder.decode(l1s_msg_buf);
       
-      // DCXの解析結果を表示
-      M5.Lcd.println("通報内容:");
-      M5.Lcd.println("詳細はシリアル出力を確認");
+      // DCXの解析結果をM5Stack画面に表示
+      M5.Lcd.println("DCX通報の詳細解析結果:");
+      
+      // DCXの基本情報を表示
+      // メッセージタイプ
+      M5.Lcd.print("メッセージ: ");
+      M5.Lcd.println(DCXDecoder::get_message_type_str_ja(dcx_decoder.r.a1_message_type));
+      
+      // 国/地域名
+      M5.Lcd.print("国/地域: ");
+      M5.Lcd.println(DCXDecoder::get_country_region_name_str_ja(dcx_decoder.r.a2_country_region_name));
+      
+      // 情報提供者
+      M5.Lcd.print("提供者: ");
+      M5.Lcd.println(DCXDecoder::get_provider_name_japan(dcx_decoder.r.a3_provider_identifier));
+      
+      // 災害カテゴリ
+      M5.Lcd.print("災害カテゴリ: ");
+      M5.Lcd.println(DCXDecoder::get_hazard_category_and_type_ja(dcx_decoder.r.a4_hazard_category_type));
+      
+      // 重大度
+      M5.Lcd.print("重大度: ");
+      M5.Lcd.println(DCXDecoder::get_severity_str_ja(dcx_decoder.r.a5_severity));
+      
+      // 災害発生日時
+      if (dcx_decoder.r.a6_hazard_onset_week_number != 0) {
+        M5.Lcd.print("災害発生週: ");
+        M5.Lcd.println(DCXDecoder::get_hazard_onset_week_number_str_ja(dcx_decoder.r.a6_hazard_onset_week_number));
+      }
+      
+      if (dcx_decoder.r.a7_hazard_onset_ToW != 0) {
+        M5.Lcd.print("災害発生日時: ");
+        M5.Lcd.println(DCXDecoder::get_hazard_onset_tow_str_ja(dcx_decoder.r.a7_hazard_onset_ToW));
+      }
+      
+      // 避難行動
+      if (dcx_decoder.r.a11_guidance_to_react_library != 0) {
+        M5.Lcd.print("避難行動: ");
+        M5.Lcd.println(DCXDecoder::get_guidance_instruction_library_ja(dcx_decoder.r.a11_guidance_to_react_library));
+      }
+      
+      // 対象地域（J-Alertの場合）
+      if (dcx_decoder.r.a1_message_type == DCX_MSG_J_ALERT) {
+        M5.Lcd.println("対象地域: J-Alert対象地域");
+        M5.Lcd.println("詳細はシリアル出力を確認");
+      }
       
       // シリアルに詳細を出力
       Serial.println("=== Saved DCX Report Analysis ===");
@@ -1091,6 +1307,18 @@ void displayDetailedDCReport() {
   M5.Lcd.println("==================");
   M5.Lcd.println("ボタンA: 通常表示");
   M5.Lcd.println("ボタンB: 一覧表示");
+  if (dcReportCount > 1) {
+    M5.Lcd.println("ボタンC: 前の通報");
+  } else {
+    M5.Lcd.println("ボタンC: 最新通報");
+  }
+  
+  // 残り時間を表示
+  unsigned long elapsedTime = millis() - detailViewStartTime;
+  unsigned long remainingTime = DETAIL_VIEW_DURATION - elapsedTime;
+  if (remainingTime > 0) {
+    M5.Lcd.printf("自動復帰まで: %lus", (remainingTime / 1000) + 1);
+  }
 }
 
 unsigned long lastDebugTime = 0;
@@ -1126,21 +1354,41 @@ void loop() {
     Serial.print(qzssMaxCno);
     Serial.println("dB");
     
-    // QZSS設定の確認
-    if (qzssCount == 0) {
-      Serial.println("WARNING: No QZSS satellites detected!");
-      Serial.println("Possible causes:");
-      Serial.println("1. QZSS not enabled in GNSS configuration");
-      Serial.println("2. No QZSS satellites visible from current location");
-      Serial.println("   (QZSS satellites are primarily visible in Asia-Pacific region)");
-      Serial.println("3. Antenna orientation issue");
-      Serial.println("4. Hardware connection problem");
-      Serial.println("5. Time of day (QZSS satellites may not be visible at certain times)");
+      // QZSS設定の確認
+  if (qzssCount == 0) {
+    Serial.println("WARNING: No QZSS satellites detected!");
+    Serial.println("Possible causes:");
+    Serial.println("1. QZSS not enabled in GNSS configuration");
+    Serial.println("2. No QZSS satellites visible from current location");
+    Serial.println("   (QZSS satellites are primarily visible in Asia-Pacific region)");
+    Serial.println("3. Antenna orientation issue");
+    Serial.println("4. Hardware connection problem");
+    Serial.println("5. Time of day (QZSS satellites may not be visible at certain times)");
+    
+    // QZSS設定の再確認
+    Serial.println("=== QZSS Configuration Check ===");
+    if (checkQZSSConfig()) {
+      Serial.println("QZSS is enabled in GNSS configuration");
+    } else {
+      Serial.println("QZSS is NOT enabled in GNSS configuration");
+      Serial.println("Attempting to re-enable QZSS...");
+      enableQZSS();
     }
+  }
     
     Serial.println("=== END STATUS REPORT ===");
     
     lastDebugTime = millis();
+  }
+  
+  // 詳細表示のタイマーチェック
+  if (isDetailView && (millis() - detailViewStartTime > DETAIL_VIEW_DURATION)) {
+    // 3秒経過したら通常表示に戻る
+    Serial.println("Detail view timeout - returning to normal display");
+    displaySatelliteInfo();
+    currentDetailIndex = -1;
+    isDetailView = false;
+    return;
   }
   
   // M5Stackのボタン処理
@@ -1149,16 +1397,37 @@ void loop() {
     // ボタンAで画面更新
     Serial.println("Button A pressed - updating display");
     displaySatelliteInfo();
+    // 詳細表示モードをリセット
+    currentDetailIndex = -1;
+    isDetailView = false;
   }
   if (M5.BtnB.wasPressed()) {
     // ボタンBで保存済みDC通報表示
     Serial.println("Button B pressed - displaying saved DC reports");
     displaySavedDCReports();
+    // 詳細表示モードをリセット
+    currentDetailIndex = -1;
+    isDetailView = false;
   }
   if (M5.BtnC.wasPressed()) {
-    // ボタンCで詳細表示
-    Serial.println("Button C pressed - detailed view");
-    displayDetailedDCReport();
+    // ボタンCで詳細表示または次の通報
+    Serial.println("Button C pressed");
+    
+    if (isDetailView && currentDetailIndex > 0) {
+      // 詳細表示モードで、まだ古い通報がある場合
+      Serial.printf("Showing previous report: %d\n", currentDetailIndex - 1);
+      displayDetailedDCReport(currentDetailIndex - 1);
+    } else if (!isDetailView && dcReportCount > 0) {
+      // 詳細表示モードでない場合、最新通報を表示
+      Serial.println("Showing latest report");
+      displayDetailedDCReport();
+    } else if (isDetailView && currentDetailIndex == 0) {
+      // 最古の通報まで到達した場合
+      Serial.println("Reached oldest report, cycling back to latest");
+      displayDetailedDCReport(dcReportCount - 1);
+    }
+    
+    // ボタンCを押した時はタイマーをリセット（詳細表示関数内で再設定される）
   }
 }
 
