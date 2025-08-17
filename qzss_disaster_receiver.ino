@@ -76,7 +76,7 @@ const unsigned long DISPLAY_UPDATE_INTERVAL = 3000;  // 画面更新間隔（3�
 
 // SDカード関連
 bool sdCardAvailable = false;  // SDカードの利用可能性
-const char* LOG_FILE_NAME = "/dc_reports.csv";  // ログファイル名
+String currentLogFileName = "";  // 現在のログファイル名（日時付き）
 unsigned long lastSDCheck = 0;  // 最後のSDカードチェック時刻
 const unsigned long SD_CHECK_INTERVAL = 30000;  // SDカードチェック間隔（30秒）
 
@@ -136,9 +136,12 @@ bool initSDCard() {
     Serial.println("WARNING: SD card size is very small - may not be properly formatted");
   }
   
+  // 日時付きファイル名を生成
+  currentLogFileName = generateLogFileName();
+  
   // CSVファイルのヘッダーを作成
   Serial.println("Testing file write access...");
-  File file = SD.open(LOG_FILE_NAME, FILE_WRITE);
+  File file = SD.open(currentLogFileName.c_str(), FILE_WRITE);
   if (!file) {
     Serial.println("ERROR: Failed to open file for writing!");
     Serial.println("Possible causes:");
@@ -157,7 +160,7 @@ bool initSDCard() {
   
   file.close();
   Serial.println("SUCCESS: SD card initialized successfully");
-  Serial.printf("Log file: %s\n", LOG_FILE_NAME);
+  Serial.printf("Log file: %s\n", currentLogFileName.c_str());
   Serial.println("=== SD Card Initialization Complete ===");
   return true;
 }
@@ -199,7 +202,7 @@ void saveDCReportToSD(uint8_t messageType, uint8_t svId, uint8_t numWords, uint3
     return;
   }
   
-  File file = SD.open(LOG_FILE_NAME, FILE_APPEND);
+  File file = SD.open(currentLogFileName.c_str(), FILE_APPEND);
   if (!file) {
     Serial.println("Failed to open file for appending");
     Serial.println("SD card may be write-protected, full, or removed");
@@ -273,7 +276,36 @@ void saveDCReportToSD(uint8_t messageType, uint8_t svId, uint8_t numWords, uint3
   file.println(reportContent);
   
   file.close();
-  Serial.printf("DC Report saved to SD: %s\n", LOG_FILE_NAME);
+  Serial.printf("DC Report saved to SD: %s\n", currentLogFileName.c_str());
+}
+
+// 日時付きログファイル名を生成する関数
+String generateLogFileName() {
+  // 現在時刻を取得（GNSS時刻が利用できない場合はシステム時刻を使用）
+  unsigned long currentTime = millis();
+  String timestamp = "";
+  
+  if (currentGNSSTime.isValid) {
+    // GNSS時刻を使用
+    uint8_t jstHour, jstMin, jstSec;
+    convertToJST(currentGNSSTime.hour, currentGNSSTime.min, currentGNSSTime.sec, jstHour, jstMin, jstSec);
+    timestamp = String(2025) + 
+                String(currentGNSSTime.month < 10 ? "0" : "") + String(currentGNSSTime.month) + 
+                String(currentGNSSTime.day < 10 ? "0" : "") + String(currentGNSSTime.day) + "_" +
+                String(jstHour < 10 ? "0" : "") + String(jstHour) + 
+                String(jstMin < 10 ? "0" : "") + String(jstMin) + 
+                String(jstSec < 10 ? "0" : "") + String(jstSec);
+  } else {
+    // システム時刻を使用（起動からの経過時間）
+    unsigned long seconds = currentTime / 1000;
+    unsigned long minutes = seconds / 60;
+    unsigned long hours = minutes / 60;
+    timestamp = "boot_" + String(hours) + 
+                String((minutes % 60) < 10 ? "0" : "") + String(minutes % 60) + 
+                String((seconds % 60) < 10 ? "0" : "") + String(seconds % 60);
+  }
+  
+  return "/dc_reports_" + timestamp + ".csv";
 }
 
 // GNSS時刻を日本時間に変換する関数
