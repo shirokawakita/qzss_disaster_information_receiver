@@ -430,6 +430,84 @@ DCX通報の詳細解析結果:
 - **BeiDou**: 中国測位システム
 - **GLONASS**: ロシア測位システム
 
+### QZSS衛星番号取得方法
+
+#### **NAVSATメッセージからの取得**
+QZSSの衛星番号は主に**NAVSATメッセージ**（UBX-NAV-SAT）から取得されます。
+
+```cpp
+void newNAVSAT(UBX_NAV_SAT_data_t *data) {
+  for (uint16_t block = 0; block < data->header.numSvs && satelliteCount < MAX_SATELLITES; block++) {
+    satellites[satelliteCount].gnssId = data->blocks[block].gnssId;    // 5 = QZSS
+    satellites[satelliteCount].svId = data->blocks[block].svId;        // 1-8 = 衛星番号
+    satellites[satelliteCount].cno = data->blocks[block].cno;          // 信号強度
+    satellites[satelliteCount].isQZSS = (data->blocks[block].gnssId == 5);
+  }
+}
+```
+
+#### **QZSS衛星の識別**
+- **GNSS ID**: `gnssId == 5` でQZSS衛星を識別
+- **SV ID**: `svId` で衛星番号を取得（1-8の範囲）
+- **表示形式**: `QZSS-01`, `QZSS-02` 等で表示
+
+#### **SFRBXメッセージからの確認**
+L1S信号受信時にも衛星番号を確認：
+
+```cpp
+void newSFRBX(UBX_RXM_SFRBX_data_t *data) {
+  if (data->gnssId == 5) {  // QZSSの場合
+    Serial.print("[L1S Message] SV:");
+    Serial.print(data->svId);  // 衛星番号を取得
+  }
+}
+```
+
+### NAVSATメッセージ（UBX-NAV-SAT）について
+
+#### **基本概念**
+**NAVSAT**（Navigation Satellite）は、u-blox GNSSモジュールが送信する**UBXメッセージ**の一種で、現在受信している衛星の詳細情報を提供します。
+
+#### **含まれる情報**
+- **gnssId**: 衛星システムID（0=GPS, 5=QZSS等）
+- **svId**: 衛星番号（QZSSは1-8）
+- **cno**: 信号強度（C/N0値、dB単位）
+- **elev**: 仰角
+- **azim**: 方位角
+- **flags**: フラグ情報
+
+#### **衛星システムID（gnssId）**
+- **0**: GPS
+- **1**: SBAS
+- **2**: Galileo
+- **3**: BeiDou
+- **4**: IMES
+- **5**: QZSS ← QZSS衛星
+- **6**: GLONASS
+
+#### **更新頻度と特徴**
+- **更新頻度**: 1秒間隔で更新
+- **情報内容**: 現在受信中の衛星のみ
+- **信号強度**: C/N0値で正確な信号強度を提供
+- **位置情報**: 仰角・方位角で衛星の位置を表示
+
+#### **QZSSでの重要性**
+NAVSATメッセージは、QZSS衛星の受信状況を監視し、L1S信号の受信可能性を判断する上で重要な情報源となっています。
+
+```cpp
+// QZSS衛星の検出例
+int qzssCount = 0;
+for (int i = 0; i < satelliteCount; i++) {
+  if (satellites[i].isQZSS) {
+    qzssCount++;
+    Serial.printf("QZSS detected: SV-%02d, Signal: %ddB, L1S: %s\n", 
+                 satellites[i].svId, 
+                 satellites[i].cno, 
+                 satellites[i].isL1S ? "YES" : "NO");
+  }
+}
+```
+
 ### 通信仕様
 - **シリアル通信**: 9600bps（初期）、38400bps（自動切り替え）
 - **通信プロトコル**: UBX
